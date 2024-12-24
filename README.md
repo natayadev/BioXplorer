@@ -1,6 +1,6 @@
 # BioXplorer
 
-Es una aplicación de línea de comandos (CLI) que permite buscar secuencias biológicas en la base de datos NCBI y realizar análisis exploratorios básicos como transcripción, traducción y cálculo de contenido GC. También permite guardar los resultados en formato FASTA o CSV.
+Es una aplicación de línea de comandos (CLI) que permite buscar secuencias biológicas en la base de datos NCBI y realizar análisis exploratorios básicos como transcripción, traducción y cálculo de contenido GC. También permite guardar los resultados en diferentes formatos.
 
 ## Requisitos
 
@@ -40,10 +40,10 @@ Es una aplicación de línea de comandos (CLI) que permite buscar secuencias bio
 2. **Ejecución del script:** Para buscar secuencias por una palabra clave y realizar análisis, ejecuta el siguiente comando:
 
     ```bash
-    python bioxplorer.py "homo sapiens"
+    python bioxplorer.py "melanogaster"
     ```
 
     Elige la secuencia que desees analizar de las opciones numéricas listadas y sigue las instrucciones en pantalla para realizar el análisis o guardar los resultados.
 
 
-3. **Guardar los resultados:** Puedes elegir guardar los resultados en formato FASTA o CSV.
+3. **Guardar los resultados:** Puedes elegir guardar los resultados en formato FASTA, FASTQ, JSON o CSV.

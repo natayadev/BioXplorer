@@ -1,6 +1,6 @@
 from Bio import Entrez, SeqIO
 from Bio.SeqUtils import gc_fraction
-from config.saver import save_fasta, save_csv, save_fastq, save_json
+from config.saver import data_directory, generate_report, save_fasta, save_csv, save_fastq, save_json, save_all
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,7 +23,6 @@ def complete_sequence(seq):
 
 def fetch_and_analyze(id_list):
     """Obtiene y analiza las secuencias a partir de una lista de IDs."""
-    print("Eligiendo secuencia... 🧐\n")
     valid_ids = []
 
     for idx, seq_id in enumerate(id_list, 1):
@@ -31,7 +30,7 @@ def fetch_and_analyze(id_list):
             handle = Entrez.efetch(db="nucleotide", id=seq_id, rettype="gb", retmode="text")
             record = SeqIO.read(handle, "genbank")
             
-            valid_ids.append((seq_id, record))  # Agregar solo secuencias válidas
+            valid_ids.append((seq_id, record))
             print(f"{idx}. ID de secuencia: {seq_id}")
             print(f"   Descripción: {record.description}")
             print(f"   Organismo: {record.annotations.get('organism', 'Desconocido')}")
@@ -63,14 +62,15 @@ def fetch_and_analyze(id_list):
                 protein_seq = selected_record.seq.translate()
 
                 print("\n🔬 Análisis de la secuencia:")
-                print(f"🌱 Transcripción (ARN): {rna_seq[:50]}...") 
-                print(f"🥩 Traducción (Proteína): {protein_seq[:50]}...")
+                print(f"🌱 Transcripción (ARN): {rna_seq[:50]}... Longitud: {len(rna_seq)}")
+                print(f"🥩 Traducción (Proteína): {protein_seq[:50]}... Longitud: {len(protein_seq)}")
 
                 gc_content = gc_fraction(selected_record.seq)
                 print(f"🧪 Contenido de GC: {gc_content:.2f}%")
 
                 try:
-                    save_choice = input("\n¿Te gustaría guardar los resultados? (fasta/csv/fastq/json/no): ").lower()
+                    save_choice = input("\n¿Te gustaría guardar los resultados? (fasta/csv/fastq/json/all/no): ").lower()
+                    data_directory()
                     if save_choice == "fasta":
                         save_fasta(selected_record)
                     elif save_choice == "csv":
@@ -79,14 +79,20 @@ def fetch_and_analyze(id_list):
                         save_fastq(selected_record)
                     elif save_choice == "json":
                         save_json(selected_record)
+                    elif save_choice == "all":
+                        save_all(selected_record)
                     
+                    report_choice = input("\n¿Te gustaría generar un reporte HTML con el análisis? (si/no): ").lower()
+                    if report_choice == "si":
+                        generate_report(selected_record, gc_content, [])
                     break 
 
                 except ValueError:
-                    print("❌ Selección inválida. Debes ingresar un número entero válido.")
+                    if choice < 1 or choice > len(valid_ids):
+                        print(f"❌ Selección inválida: el número debe estar entre 1 y {len(valid_ids)}. Intenta de nuevo.")
             except Exception as e:
                 print(f"⚠️ Hubo un error al procesar la secuencia. Error: {e}\nVolviendo a intentar...\n")
                 continue  # Volver a intentar la selección si ocurre un error
-
+                continue
     else:
         print("❌ No se encontraron secuencias válidas para analizar.")

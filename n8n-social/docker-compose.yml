@@ -1,0 +1,28 @@
+# n8n local para el prototipo de contenido. Uso: cp .env.example .env && docker compose up -d
+services:
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest   # tras la primera prueba, fijá una versión concreta (ej. :1.x.y)
+    container_name: n8n-contenido
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5678:5678"               # sólo accesible desde tu máquina
+    env_file: .env
+    environment:
+      - TZ=America/Argentina/Buenos_Aires
+      - GENERIC_TIMEZONE=America/Argentina/Buenos_Aires
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - N8N_HOST=127.0.0.1
+      - N8N_EDITOR_BASE_URL=http://127.0.0.1:5678
+      - WEBHOOK_URL=http://127.0.0.1:5678/
+      - N8N_SECURE_COOKIE=false             # sólo porque es http local
+      # Necesario para leer $env.* (MODO_PRUEBA, IDs de Drive, etc.) en nodos y expresiones
+      - N8N_BLOCK_ENV_ACCESS_IN_NODE=false
+      # Una ejecución a la vez: evita que dos corridas tomen la misma pieza
+      - N8N_CONCURRENCY_PRODUCTION_LIMIT=1
+      - EXECUTIONS_DATA_PRUNE=true
+      - EXECUTIONS_DATA_MAX_AGE=336
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+volumes:
+  n8n_data:

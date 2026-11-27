@@ -1,0 +1,1453 @@
+{
+  "name": "A - Diseño de piezas aprobadas (Notion -> Canva -> Drive)",
+  "nodes": [
+    {
+      "id": "77e82481-08dc-4c93-a8d1-639c3e3a72b2",
+      "name": "Cada 15 minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ea0df97f-394a-4458-81d4-09bbccad4d36",
+      "name": "Ejecutar a mano (prueba)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        470
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "e863f20d-21f8-43ad-87d9-438c3726b3b1",
+      "name": "Notion: buscar piezas aprobadas sin archivo",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "getAll",
+        "databaseId": {
+          "__rl": true,
+          "value": "={{ $env.NOTION_DATABASE_ID }}",
+          "mode": "id"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "simple": false,
+        "filterType": "json",
+        "filterJson": "={{ JSON.stringify({ and: [\n  { property: 'Estado', status: { equals: 'Aprobado' } },\n  { property: 'Archivo en Drive', url: { is_empty: true } },\n  { or: ['Carrusel', 'Post', 'Flyer', 'Story'].map(t => ({ property: 'Tipo', select: { equals: t } })) },\n  { or: [ { property: 'Error', rich_text: { is_empty: true } }, { property: 'Error', rich_text: { starts_with: 'ERROR (intento' } } ] }\n] }) }}",
+        "options": {
+          "sort": {
+            "sortValue": [
+              {
+                "timestamp": false,
+                "key": "Fecha de publicación|date",
+                "direction": "ascending"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Estado=Aprobado, \"Archivo en Drive\" vacío, Tipo en Carrusel/Post/Flyer/Story y Error vacío (o reintento pendiente). Toma 1 pieza por corrida para evitar duplicados.",
+      "notesInFlow": true
+    },
+    {
+      "id": "c6f8d933-42be-4eb0-8477-ba39e97a8aca",
+      "name": "Preparar pieza y elegir plantilla",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// ---- Utilidades (se repiten en cada nodo para que cada uno sea autosuficiente) ----\nconst TZ = 'America/Argentina/Buenos_Aires';\nconst txt = a => (a || []).map(t => t.plain_text).join('');\nconst sel = p => (p && (p.status || p.select)) ? (p.status || p.select).name : '';\nconst CALIDAD = ['Una idea y gancho', 'Fuente y permiso', 'Corregido otro día', 'Tamaño correcto'];\nfunction leer(page) {\n  const p = page.properties || {};\n  const fecha = p['Fecha de publicación'] && p['Fecha de publicación'].date ? p['Fecha de publicación'].date.start : '';\n  return {\n    pageId: page.id,\n    pageUrl: page.url,\n    titulo: txt(p['Contenido'] && p['Contenido'].title),\n    estado: sel(p['Estado']),\n    tipo: sel(p['Tipo']),\n    plataformas: ((p['Plataforma'] && p['Plataforma'].multi_select) || []).map(o => o.name),\n    fecha,\n    ganchoCopy: txt(p['Gancho y Copy'] && p['Gancho y Copy'].rich_text),\n    enlaceCanva: (p['Enlace Canva'] && p['Enlace Canva'].url) || '',\n    archivo: (p['Archivo en Drive'] && p['Archivo en Drive'].url) || '',\n    enlacePost: (p['Enlace del post'] && p['Enlace del post'].url) || '',\n    errorActual: txt(p['Error'] && p['Error'].rich_text),\n    calidad: CALIDAD.map(k => !!(p[k] && p[k].checkbox)),\n  };\n}\nconst slug = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()\n  .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/g, '') || 'sin-titulo';\nconst SOPORTADAS = ['Instagram', 'LinkedIn', 'X'];\n\n// ============ EDITAR: IDs de plantillas de marca de Canva (\"Brand template ID\") ============\n// Una plantilla por combinación Plataforma|Tipo, ya creada con el tamaño correcto.\n// Cada plantilla debe tener dos campos de texto de autofill: \"gancho\" y \"copy\".\nconst PLANTILLAS = {\n  'Instagram|Post':     { id: 'REEMPLAZAR_IG_POST',     w: 1080, h: 1350, fmt: 'jpg' },\n  'Instagram|Carrusel': { id: 'REEMPLAZAR_IG_CARRUSEL', w: 1080, h: 1350, fmt: 'jpg', multi: true },\n  'Instagram|Flyer':    { id: 'REEMPLAZAR_IG_FLYER',    w: 1080, h: 1350, fmt: 'jpg' },\n  'Instagram|Story':    { id: 'REEMPLAZAR_IG_STORY',    w: 1080, h: 1920, fmt: 'jpg' },\n  'LinkedIn|Carrusel':  { id: 'REEMPLAZAR_LI_CARRUSEL', w: 1080, h: 1350, fmt: 'pdf' },\n  'LinkedIn|Post':      { id: 'REEMPLAZAR_LI_POST',     w: 1200, h: 1200, fmt: 'jpg' },\n  'LinkedIn|Flyer':     { id: 'REEMPLAZAR_LI_FLYER',    w: 1200, h: 1200, fmt: 'jpg' },\n  'X|Post':             { id: 'REEMPLAZAR_X_POST',      w: 1200, h: 675,  fmt: 'jpg' },\n  'X|Flyer':            { id: 'REEMPLAZAR_X_FLYER',     w: 1200, h: 675,  fmt: 'jpg' },\n};\n// ===========================================================================================\n\nconst p = leer($input.first().json);\nconst bloquear = motivo => [{ json: { ...p, valido: false, motivo: 'BLOQUEADO: ' + motivo } }];\n\nconst plats = p.plataformas.filter(x => SOPORTADAS.includes(x));\nif (plats.length === 0) return bloquear('la pieza no tiene Instagram, LinkedIn ni X en Plataforma.');\nif (plats.length > 1) return bloquear('una pieza = una plataforma de diseño. Duplicá la fila (una por plataforma).');\nconst plataforma = plats[0];\nconst plantilla = PLANTILLAS[plataforma + '|' + p.tipo];\nif (!plantilla) return bloquear('no hay medida/plantilla definida para ' + plataforma + ' + ' + p.tipo + '.');\nif (plantilla.id.startsWith('REEMPLAZAR')) return bloquear('falta cargar el ID de plantilla de Canva para ' + plataforma + ' + ' + p.tipo + ' (editar en este nodo Code).');\n\nconst lineas = p.ganchoCopy.split(/\\r?\\n/).map(s => s.trim());\nconst gancho = lineas[0] || '';\nconst copy = lineas.slice(1).join('\\n').trim();\nif (!gancho || !copy) return bloquear('\"Gancho y Copy\" necesita gancho en la primera línea y copy debajo.');\n\nconst base = p.fecha ? DateTime.fromISO(p.fecha, { zone: TZ }) : DateTime.now().setZone(TZ);\nconst fechaTxt = base.toFormat('yyyy-LL-dd');\nconst nombreBase = fechaTxt + '_' + plataforma + '_' + p.tipo + '_' + slug(p.titulo);\n\nreturn [{ json: {\n  ...p, valido: true, plataforma, plantilla,\n  mes: base.toFormat('yyyy-LL'), nombreBase,\n  autofillBody: {\n    brand_template_id: plantilla.id,\n    title: nombreBase,\n    data: { gancho: { type: 'text', text: gancho }, copy: { type: 'text', text: copy } },\n  },\n} }];\n"
+      }
+    },
+    {
+      "id": "44f8ca35-313b-4fce-83a4-175c8ff8159a",
+      "name": "¿Pieza válida?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        840,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "0c1cfb89-98e3-457f-aade-28eb3854e189",
+              "leftValue": "={{ $json.valido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "f923574b-c938-4e3f-b653-6c64aaf9161c",
+      "name": "Notion: registrar bloqueo",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "={{ $json.motivo }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Deja el motivo en \"Error\". Para reintentar, corregí la pieza y borrá el campo Error.",
+      "notesInFlow": true
+    },
+    {
+      "id": "64da634e-8be1-48b8-9a9a-0697f5806710",
+      "name": "Notion: marcar en proceso",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        470
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "=EN PROCESO (diseño) {{ $now.toISO() }} - ejecución {{ $execution.id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Bloqueo anti-duplicados: mientras Error empiece con \"EN PROCESO\" ningún flujo toma la pieza.",
+      "notesInFlow": true
+    },
+    {
+      "id": "409e0b3c-fa52-4d34-84e3-cf4ea15836fa",
+      "name": "Drive: buscar carpeta del mes",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "resource": "fileFolder",
+        "operation": "search",
+        "searchMethod": "name",
+        "queryString": "={{ $('Preparar pieza y elegir plantilla').first().json.mes }}",
+        "returnAll": false,
+        "limit": 1,
+        "filter": {
+          "driveId": {
+            "__rl": true,
+            "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+            "mode": "id"
+          },
+          "folderId": {
+            "__rl": true,
+            "value": "={{ $env.DRIVE_ROOT_FOLDER_ID }}",
+            "mode": "id"
+          },
+          "whatToSearch": "folders"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "alwaysOutputData": true,
+      "notes": "Busca AAAA-MM dentro de la carpeta \"Contenido\" de la unidad compartida.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "c372a867-89b7-403d-8c2d-1798762a1009",
+      "name": "¿Existe la carpeta del mes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "11a8c519-e532-4e4c-86e6-db5cc86731c4",
+              "leftValue": "={{ !!$json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7771c863-1bc6-4730-9e44-501d18729ba4",
+      "name": "Drive: crear carpeta del mes",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1960,
+        300
+      ],
+      "parameters": {
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $('Preparar pieza y elegir plantilla').first().json.mes }}",
+        "driveId": {
+          "__rl": true,
+          "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+          "mode": "id"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $env.DRIVE_ROOT_FOLDER_ID }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "88a5a09c-e08b-40ae-a5df-f8c53df1ab0a",
+      "name": "Carpeta del mes (ID)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1960,
+        470
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "1a9e0e9a-0631-49ef-a29e-6db565ce851f",
+              "name": "id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "5a6c9805-e350-4994-8f9b-9a5d2a0860b3",
+      "name": "Drive: buscar carpeta del tipo",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2240,
+        300
+      ],
+      "parameters": {
+        "resource": "fileFolder",
+        "operation": "search",
+        "searchMethod": "name",
+        "queryString": "={{ $('Preparar pieza y elegir plantilla').first().json.tipo }}",
+        "returnAll": false,
+        "limit": 1,
+        "filter": {
+          "driveId": {
+            "__rl": true,
+            "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+            "mode": "id"
+          },
+          "folderId": {
+            "__rl": true,
+            "value": "={{ $('Carpeta del mes (ID)').first().json.id }}",
+            "mode": "id"
+          },
+          "whatToSearch": "folders"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "alwaysOutputData": true,
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b309e458-2dce-4cbe-a501-c308261ea6aa",
+      "name": "¿Existe la carpeta del tipo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2520,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "22709336-6a98-413a-9a55-e9f7249b1a96",
+              "leftValue": "={{ !!$json.id }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7dbee7a7-93ce-4a58-9755-4fbfa814bce4",
+      "name": "Drive: crear carpeta del tipo",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2800,
+        300
+      ],
+      "parameters": {
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $('Preparar pieza y elegir plantilla').first().json.tipo }}",
+        "driveId": {
+          "__rl": true,
+          "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+          "mode": "id"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $('Carpeta del mes (ID)').first().json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "8124188e-b0f8-4965-a7ea-8bc031fa140f",
+      "name": "Carpeta del tipo (ID)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        2800,
+        470
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "171662ea-1007-46f7-9f82-6108f7cb047a",
+              "name": "id",
+              "value": "={{ $json.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "07d7386b-cf08-42d0-8114-eeadc5d30e4d",
+      "name": "¿Va en subcarpeta propia? (carrusel de imágenes)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "49e69aa5-698c-4ba2-be52-adb7a2e3b6ca",
+              "leftValue": "={{ !!$('Preparar pieza y elegir plantilla').first().json.plantilla.multi }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Los carruseles de Instagram son varias imágenes JPG: se guardan en una subcarpeta y \"Archivo en Drive\" lleva el enlace a esa carpeta.",
+      "notesInFlow": true
+    },
+    {
+      "id": "ab64c960-63fc-4775-a6cf-a4ea132dd30d",
+      "name": "Drive: crear subcarpeta de la pieza",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        3360,
+        300
+      ],
+      "parameters": {
+        "resource": "folder",
+        "operation": "create",
+        "name": "={{ $('Preparar pieza y elegir plantilla').first().json.nombreBase }}",
+        "driveId": {
+          "__rl": true,
+          "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+          "mode": "id"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $('Carpeta del tipo (ID)').first().json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "12ef6f31-c889-422e-8c69-d46fa9ccffa0",
+      "name": "Carpeta destino (ID)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        3360,
+        470
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f8450837-4751-469c-a8f2-1886f4de6c44",
+              "name": "id",
+              "value": "={{ $('Preparar pieza y elegir plantilla').first().json.plantilla.multi ? $('Drive: crear subcarpeta de la pieza').first().json.id : $('Carpeta del tipo (ID)').first().json.id }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a09508ab-665c-4ceb-9985-a1f5e14a43d7",
+      "name": "Canva: pedir autofill de la plantilla",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3640,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.canva.com/rest/v1/autofills",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Preparar pieza y elegir plantilla').first().json.autofillBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "",
+          "name": "Canva Connect (OAuth2 genérico)"
+        }
+      },
+      "notes": "POST /v1/autofills con brand_template_id y los campos gancho/copy.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "1ed29dce-a154-4cf8-9730-6d190f557946",
+      "name": "Esperar autofill",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        3920,
+        300
+      ],
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "4de94fe5-7da0-495a-a87d-30b08542496b",
+      "name": "Canva: consultar autofill",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4200,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.canva.com/rest/v1/autofills/{{ $('Canva: pedir autofill de la plantilla').first().json.job.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "",
+          "name": "Canva Connect (OAuth2 genérico)"
+        }
+      },
+      "notesInFlow": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "e9f6cb14-47fe-4683-93fe-73346eae4a43",
+      "name": "¿Autofill en curso?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4480,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "7c8e45d0-c4ca-4e06-93e0-3a11ee0f7b0f",
+              "leftValue": "={{ $json.job.status === 'in_progress' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "bb926518-1273-43f2-9b29-769eacf4e7c5",
+      "name": "Verificar autofill y armar exportación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4760,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst job = $json.job;\nif (job.status !== 'success') throw new Error('Canva autofill falló: ' + JSON.stringify(job.error || job).slice(0, 300));\nconst d = job.result.design;\nconst ctx = $('Preparar pieza y elegir plantilla').first().json;\nconst f = ctx.plantilla;\n// PDF para carruseles de LinkedIn; JPG con el tamaño de la tabla de medidas para el resto.\nconst format = f.fmt === 'pdf' ? { type: 'pdf' } : { type: 'jpg', quality: 92, width: f.w, height: f.h };\nreturn [{ json: { designId: d.id, designUrl: (d.urls && d.urls.edit_url) || d.url, exportBody: { design_id: d.id, format } } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "706603d4-d611-4c59-8eea-59d8a83271e5",
+      "name": "Canva: pedir exportación",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5040,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.canva.com/rest/v1/exports",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.exportBody) }}",
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "",
+          "name": "Canva Connect (OAuth2 genérico)"
+        }
+      },
+      "notes": "POST /v1/exports. Los enlaces de descarga que devuelve Canva vencen (24 h): se descargan de inmediato.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "a53f8d52-a8fc-4bf7-af0e-4fb4671041c6",
+      "name": "Esperar exportación",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        5320,
+        300
+      ],
+      "parameters": {
+        "amount": 5,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "5ab633f8-d5cf-4627-99e9-2c0831c887f1",
+      "name": "Canva: consultar exportación",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        5600,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "=https://api.canva.com/rest/v1/exports/{{ $('Canva: pedir exportación').first().json.job.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "oAuth2Api",
+        "options": {}
+      },
+      "credentials": {
+        "oAuth2Api": {
+          "id": "",
+          "name": "Canva Connect (OAuth2 genérico)"
+        }
+      },
+      "notesInFlow": false,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "90cedabc-8bf7-4104-b4d3-96cbc030ec85",
+      "name": "¿Exportación en curso?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        5880,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8e3107ce-5575-490b-9757-677bee39b7b8",
+              "leftValue": "={{ $json.job.status === 'in_progress' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "11bb7f54-3036-4131-96e4-d492b344edf7",
+      "name": "Verificar exportación y separar archivos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6160,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst job = $json.job;\nif (job.status !== 'success') throw new Error('Canva exportación falló: ' + JSON.stringify(job.error || job).slice(0, 300));\nconst ctx = $('Preparar pieza y elegir plantilla').first().json;\nconst urls = job.urls || [];\nif (!urls.length) throw new Error('Canva no devolvió archivos exportados');\nconst ext = ctx.plantilla.fmt;\nreturn urls.map((u, i) => ({ json: { url: u, fileName: ctx.nombreBase + (urls.length > 1 ? '_p' + String(i + 1).padStart(2, '0') : '') + '.' + ext } }));\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "42f86473-f280-4f33-be7d-0c5b43ade006",
+      "name": "Canva: descargar archivo exportado",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6440,
+        300
+      ],
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file",
+              "outputPropertyName": "data"
+            }
+          }
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "826c58e6-e6b8-4400-94b2-0c46645ee4b2",
+      "name": "Drive: subir archivo a la carpeta destino",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        6720,
+        300
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "upload",
+        "inputDataFieldName": "data",
+        "name": "={{ $('Verificar exportación y separar archivos').item.json.fileName }}",
+        "driveId": {
+          "__rl": true,
+          "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+          "mode": "id"
+        },
+        "folderId": {
+          "__rl": true,
+          "value": "={{ $('Carpeta destino (ID)').first().json.id }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "notes": "Nombre: AAAA-MM-DD_Plataforma_Tipo_titulo-corto. Carpeta: Contenido/AAAA-MM/Tipo.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "6831460a-dcb6-4a02-8bdd-58084da8c159",
+      "name": "Armar enlaces de resultado",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7000,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Preparar pieza y elegir plantilla').first().json;\nconst files = $input.all().map(i => i.json);\nconst designUrl = $('Verificar autofill y armar exportación').first().json.designUrl;\nconst archivo = ctx.plantilla.multi\n  ? 'https://drive.google.com/drive/folders/' + $('Carpeta destino (ID)').first().json.id\n  : 'https://drive.google.com/file/d/' + files[0].id + '/view';\nreturn [{ json: { pageId: ctx.pageId, archivo, enlaceCanva: designUrl } }];\n"
+      }
+    },
+    {
+      "id": "375f623d-a06b-4722-8d2e-56a295d4bbc4",
+      "name": "Notion: guardar enlaces del diseño",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        7280,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Archivo en Drive|url",
+              "urlValue": "={{ $json.archivo }}"
+            },
+            {
+              "key": "Enlace Canva|url",
+              "urlValue": "={{ $json.enlaceCanva }}"
+            },
+            {
+              "key": "Error|rich_text",
+              "textContent": "=Diseño OK {{ $now.toISO() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Guarda \"Archivo en Drive\" y \"Enlace Canva\". \"Diseño OK\" en Error es una marca informativa: el flujo B la acepta.",
+      "notesInFlow": true
+    },
+    {
+      "id": "3b113d24-431b-4c67-a987-ff496de3857c",
+      "name": "Registrar fallo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1680,
+        470
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Preparar pieza y elegir plantilla').first().json;\nconst e = $json.error;\nlet msg = typeof e === 'string' ? e : (e && (e.message || e.description)) || JSON.stringify($json).slice(0, 400);\nif (e && e.node && e.node.name) msg = '[' + e.node.name + '] ' + msg;\nconst m = (ctx.errorActual || '').match(/^ERROR \\(intento (\\d)\\/3\\)/);\nconst n = (m ? parseInt(m[1], 10) : 0) + 1;\nconst texto = (n >= 3 ? 'REINTENTOS AGOTADOS (3/3): ' : 'ERROR (intento ' + n + '/3): ') + msg;\nreturn [{ json: { pageId: ctx.pageId, texto: texto.slice(0, 1800) } }];\n"
+      }
+    },
+    {
+      "id": "8c6a619b-ca58-4296-b42d-810e62a4ce05",
+      "name": "Notion: guardar error",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        1960,
+        640
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "={{ $json.texto }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Estado se mantiene en Aprobado. ERROR (intento n/3) se reintenta solo en la próxima corrida; REINTENTOS AGOTADOS requiere borrar Error a mano.",
+      "notesInFlow": true
+    },
+    {
+      "id": "cc81437f-7d99-4695-8682-fa3accc1fcbc",
+      "name": "Nota 35",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        60
+      ],
+      "parameters": {
+        "content": "## A - Diseño\nCada 15 min toma 1 pieza **Aprobada** sin \"Archivo en Drive\" (Carrusel/Post/Flyer/Story), la arma en Canva, exporta, sube a Drive y guarda los enlaces en Notion.\n\n**Antes de activar:** cargar IDs de plantilla en el nodo \"Preparar pieza y elegir plantilla\", conectar credenciales (Notion, Google Drive, Canva) y completar .env.\n\nNotion es la única fuente de verdad: acá no se inventa texto, se usa \"Gancho y Copy\" tal cual (1ª línea = gancho, resto = copy).",
+        "width": 520,
+        "height": 230
+      }
+    }
+  ],
+  "connections": {
+    "Cada 15 minutos": {
+      "main": [
+        [
+          {
+            "node": "Notion: buscar piezas aprobadas sin archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar a mano (prueba)": {
+      "main": [
+        [
+          {
+            "node": "Notion: buscar piezas aprobadas sin archivo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: buscar piezas aprobadas sin archivo": {
+      "main": [
+        [
+          {
+            "node": "Preparar pieza y elegir plantilla",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar pieza y elegir plantilla": {
+      "main": [
+        [
+          {
+            "node": "¿Pieza válida?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pieza válida?": {
+      "main": [
+        [
+          {
+            "node": "Notion: marcar en proceso",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notion: registrar bloqueo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: marcar en proceso": {
+      "main": [
+        [
+          {
+            "node": "Drive: buscar carpeta del mes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: buscar carpeta del mes": {
+      "main": [
+        [
+          {
+            "node": "¿Existe la carpeta del mes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Existe la carpeta del mes?": {
+      "main": [
+        [
+          {
+            "node": "Carpeta del mes (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Drive: crear carpeta del mes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: crear carpeta del mes": {
+      "main": [
+        [
+          {
+            "node": "Carpeta del mes (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Carpeta del mes (ID)": {
+      "main": [
+        [
+          {
+            "node": "Drive: buscar carpeta del tipo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: buscar carpeta del tipo": {
+      "main": [
+        [
+          {
+            "node": "¿Existe la carpeta del tipo?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Existe la carpeta del tipo?": {
+      "main": [
+        [
+          {
+            "node": "Carpeta del tipo (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Drive: crear carpeta del tipo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: crear carpeta del tipo": {
+      "main": [
+        [
+          {
+            "node": "Carpeta del tipo (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Carpeta del tipo (ID)": {
+      "main": [
+        [
+          {
+            "node": "¿Va en subcarpeta propia? (carrusel de imágenes)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Va en subcarpeta propia? (carrusel de imágenes)": {
+      "main": [
+        [
+          {
+            "node": "Drive: crear subcarpeta de la pieza",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Carpeta destino (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: crear subcarpeta de la pieza": {
+      "main": [
+        [
+          {
+            "node": "Carpeta destino (ID)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Carpeta destino (ID)": {
+      "main": [
+        [
+          {
+            "node": "Canva: pedir autofill de la plantilla",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canva: pedir autofill de la plantilla": {
+      "main": [
+        [
+          {
+            "node": "Esperar autofill",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Esperar autofill": {
+      "main": [
+        [
+          {
+            "node": "Canva: consultar autofill",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canva: consultar autofill": {
+      "main": [
+        [
+          {
+            "node": "¿Autofill en curso?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Autofill en curso?": {
+      "main": [
+        [
+          {
+            "node": "Esperar autofill",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Verificar autofill y armar exportación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar autofill y armar exportación": {
+      "main": [
+        [
+          {
+            "node": "Canva: pedir exportación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canva: pedir exportación": {
+      "main": [
+        [
+          {
+            "node": "Esperar exportación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Esperar exportación": {
+      "main": [
+        [
+          {
+            "node": "Canva: consultar exportación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canva: consultar exportación": {
+      "main": [
+        [
+          {
+            "node": "¿Exportación en curso?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Exportación en curso?": {
+      "main": [
+        [
+          {
+            "node": "Esperar exportación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Verificar exportación y separar archivos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verificar exportación y separar archivos": {
+      "main": [
+        [
+          {
+            "node": "Canva: descargar archivo exportado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Canva: descargar archivo exportado": {
+      "main": [
+        [
+          {
+            "node": "Drive: subir archivo a la carpeta destino",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: subir archivo a la carpeta destino": {
+      "main": [
+        [
+          {
+            "node": "Armar enlaces de resultado",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Armar enlaces de resultado": {
+      "main": [
+        [
+          {
+            "node": "Notion: guardar enlaces del diseño",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar fallo": {
+      "main": [
+        [
+          {
+            "node": "Notion: guardar error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Argentina/Buenos_Aires",
+    "executionTimeout": 900
+  },
+  "pinData": {},
+  "tags": []
+}

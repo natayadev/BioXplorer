@@ -1,0 +1,2449 @@
+{
+  "name": "B - Publicación (Notion -> Drive -> LinkedIn / X / Instagram)",
+  "nodes": [
+    {
+      "id": "2e3f80d2-e30e-433f-b0a1-f0ffbfb549e6",
+      "name": "Cada 15 minutos",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "b653a874-5e54-4149-adab-834af42249de",
+      "name": "Ejecutar a mano (prueba)",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        470
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "9f7738f9-9f9d-42e7-9c44-0681d6ab3bb4",
+      "name": "Notion: buscar piezas listas para publicar",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        280,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "getAll",
+        "databaseId": {
+          "__rl": true,
+          "value": "={{ $env.NOTION_DATABASE_ID }}",
+          "mode": "id"
+        },
+        "returnAll": false,
+        "limit": 1,
+        "simple": false,
+        "filterType": "json",
+        "filterJson": "={{ (() => {\n  const prueba = String($env.MODO_PRUEBA ?? 'true').toLowerCase() !== 'false';\n  const errorOk = [\n    { property: 'Error', rich_text: { is_empty: true } },\n    { property: 'Error', rich_text: { starts_with: 'ERROR (intento' } },\n    { property: 'Error', rich_text: { starts_with: 'Diseño OK' } },\n  ];\n  if (!prueba) errorOk.push({ property: 'Error', rich_text: { starts_with: 'PRUEBA OK' } });\n  return JSON.stringify({ and: [\n    { property: 'Estado', status: { equals: 'Aprobado' } },\n    { property: 'Fecha de publicación', date: { on_or_before: $now.toISO() } },\n    { property: 'Una idea y gancho', checkbox: { equals: true } },\n    { property: 'Fuente y permiso', checkbox: { equals: true } },\n    { property: 'Corregido otro día', checkbox: { equals: true } },\n    { property: 'Tamaño correcto', checkbox: { equals: true } },\n    { property: 'Enlace del post', url: { is_empty: true } },\n    { or: ['Instagram', 'LinkedIn', 'X'].map(x => ({ property: 'Plataforma', multi_select: { contains: x } })) },\n    { or: errorOk },\n  ] });\n})() }}",
+        "options": {
+          "sort": {
+            "sortValue": [
+              {
+                "timestamp": false,
+                "key": "Fecha de publicación|date",
+                "direction": "ascending"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Estado=Aprobado + Fecha de publicación <= ahora + las 4 casillas + sin Enlace del post + Error vacío/reintento. 1 pieza por corrida. En modo prueba se salta lo que ya dice \"PRUEBA OK\".",
+      "notesInFlow": true
+    },
+    {
+      "id": "d013aed0-101a-4182-a61e-f8420e4d7b27",
+      "name": "Validar pieza y elegir ruta",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\n// ---- Utilidades (se repiten en cada nodo para que cada uno sea autosuficiente) ----\nconst TZ = 'America/Argentina/Buenos_Aires';\nconst txt = a => (a || []).map(t => t.plain_text).join('');\nconst sel = p => (p && (p.status || p.select)) ? (p.status || p.select).name : '';\nconst CALIDAD = ['Una idea y gancho', 'Fuente y permiso', 'Corregido otro día', 'Tamaño correcto'];\nfunction leer(page) {\n  const p = page.properties || {};\n  const fecha = p['Fecha de publicación'] && p['Fecha de publicación'].date ? p['Fecha de publicación'].date.start : '';\n  return {\n    pageId: page.id,\n    pageUrl: page.url,\n    titulo: txt(p['Contenido'] && p['Contenido'].title),\n    estado: sel(p['Estado']),\n    tipo: sel(p['Tipo']),\n    plataformas: ((p['Plataforma'] && p['Plataforma'].multi_select) || []).map(o => o.name),\n    fecha,\n    ganchoCopy: txt(p['Gancho y Copy'] && p['Gancho y Copy'].rich_text),\n    enlaceCanva: (p['Enlace Canva'] && p['Enlace Canva'].url) || '',\n    archivo: (p['Archivo en Drive'] && p['Archivo en Drive'].url) || '',\n    enlacePost: (p['Enlace del post'] && p['Enlace del post'].url) || '',\n    errorActual: txt(p['Error'] && p['Error'].rich_text),\n    calidad: CALIDAD.map(k => !!(p[k] && p[k].checkbox)),\n  };\n}\nconst slug = s => String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase()\n  .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/g, '') || 'sin-titulo';\nconst SOPORTADAS = ['Instagram', 'LinkedIn', 'X'];\n\nconst MODO_PRUEBA = String($env.MODO_PRUEBA ?? 'true').toLowerCase() !== 'false'; // cualquier valor distinto de \"false\" = prueba\nconst MAX_HASHTAGS = 3, MAX_EMOJIS = 2;\nconst LIMITE = { x: 280, linkedin: 3000, instagram: 2200 };\n\nconst p = leer($input.first().json);\nconst salir = (motivo, prefijo) => [{ json: { ...p, valido: false, modoPrueba: MODO_PRUEBA, motivo: (prefijo || 'BLOQUEADO') + ': ' + motivo } }];\n\nif (p.estado !== 'Aprobado') return salir('Estado no es Aprobado.');\nif (!p.calidad.every(Boolean)) return salir('faltan casillas de calidad.');\nif (!p.fecha) return salir('falta Fecha de publicación.');\nif (DateTime.fromISO(p.fecha, { zone: TZ }) > DateTime.now()) return salir('todavía no es la fecha de publicación.');\nif (p.enlacePost) return salir('ya tiene \"Enlace del post\" (posible duplicado).');\n\nconst plats = p.plataformas.filter(x => SOPORTADAS.includes(x));\nif (plats.length !== 1) return salir(plats.length ? 'una pieza = una plataforma (duplicá la fila).' : 'sin plataforma soportada.');\nconst plataforma = plats[0];\n\nconst RUTAS = {\n  'Instagram|Post': 'instagram', 'Instagram|Carrusel': 'instagram', 'Instagram|Flyer': 'instagram',\n  'LinkedIn|Carrusel': 'linkedin_pdf', 'LinkedIn|Post': 'linkedin_imagen', 'LinkedIn|Flyer': 'linkedin_imagen',\n  'X|Post': 'x_imagen', 'X|Flyer': 'x_imagen', 'X|Hilo': 'x_hilo',\n};\nif (plataforma === 'Instagram' && p.tipo === 'Story') {\n  return salir('Story de Instagram: publicar a mano (este prototipo no la automatiza). Archivo: ' + (p.archivo || 'sin archivo'), 'MANUAL IG');\n}\nconst ruta = RUTAS[plataforma + '|' + p.tipo];\nif (!ruta) return salir('combinación no soportada: ' + plataforma + ' + ' + p.tipo + '.');\n\nconst necesitaArchivo = ruta !== 'x_hilo';\nif (necesitaArchivo && !p.archivo) return salir('falta \"Archivo en Drive\" (corré el flujo A).');\nconst esCarpeta = /drive\\.google\\.com\\/drive\\/(u\\/\\d+\\/)?folders\\//.test(p.archivo);\nconst m = p.archivo.match(/\\/folders\\/([A-Za-z0-9_-]+)/) || p.archivo.match(/\\/d\\/([A-Za-z0-9_-]+)/) || p.archivo.match(/[?&]id=([A-Za-z0-9_-]+)/);\nconst fileId = m ? m[1] : '';\nif (necesitaArchivo && !fileId) return salir('no pude leer el ID de Drive desde \"Archivo en Drive\".');\nif (esCarpeta && ruta !== 'instagram') return salir('\"Archivo en Drive\" es una carpeta pero esta ruta espera un solo archivo.');\n\n// Texto: se publica tal cual está en Notion (no se inventa nada)\nconst texto = p.ganchoCopy.trim();\nif (!texto) return salir('\"Gancho y Copy\" está vacío.');\nconst partes = ruta === 'x_hilo' ? texto.split(/\\n\\s*-{3,}\\s*\\n/).map(s => s.trim()).filter(Boolean) : [texto];\nconst hashtags = (texto.match(/#[\\p{L}\\p{N}_]+/gu) || []).length;\nconst emojis = (texto.match(/\\p{Extended_Pictographic}/gu) || []).length;\nif (hashtags > MAX_HASHTAGS) return salir('demasiados hashtags (' + hashtags + ', máximo ' + MAX_HASHTAGS + ').');\nif (emojis > MAX_EMOJIS) return salir('demasiados emojis (' + emojis + ', máximo ' + MAX_EMOJIS + ').');\nconst lim = plataforma === 'X' ? LIMITE.x : plataforma === 'LinkedIn' ? LIMITE.linkedin : LIMITE.instagram;\nconst largo = Math.max(...partes.map(s => [...s].length));\nif (largo > lim) return salir('el texto supera el límite de ' + plataforma + ' (' + largo + ' > ' + lim + ').');\nif (ruta === 'x_hilo' && partes.length < 2) return salir('un hilo necesita al menos 2 partes separadas por una línea con ---.');\n\n// LinkedIn (API Posts, \"little text format\"): se escapan los caracteres reservados, menos #\nconst textoLinkedIn = texto.replace(/[\\\\|{}@\\[\\]()<>*_~]/g, c => '\\\\' + c);\n\nreturn [{ json: {\n  ...p, valido: true, modoPrueba: MODO_PRUEBA, plataforma, ruta, necesitaArchivo, esCarpeta, fileId,\n  texto, textoLinkedIn, partes,\n  nombreBase: DateTime.fromISO(p.fecha, { zone: TZ }).toFormat('yyyy-LL-dd') + '_' + plataforma + '_' + p.tipo + '_' + slug(p.titulo),\n} }];\n"
+      }
+    },
+    {
+      "id": "3d663a02-512a-48b5-ba28-28e6bdfd5fe3",
+      "name": "¿Pieza válida?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        840,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "76b67eb5-22a3-4e8d-a338-35734d873bb7",
+              "leftValue": "={{ $json.valido }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "4f210f45-9b06-4808-9ef0-616e39f0ab4a",
+      "name": "Notion: registrar bloqueo o aviso manual",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "={{ $json.motivo }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "BLOQUEADO / MANUAL IG: no se publica. Corregí la pieza y borrá el campo Error para reintentar. Estado queda en Aprobado.",
+      "notesInFlow": true
+    },
+    {
+      "id": "cec96264-18bd-4cdf-b888-8882bb54827c",
+      "name": "¿Modo prueba? (antes de bloquear)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e43d3472-7ea1-4599-bbae-614c4f1b6f25",
+              "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.modoPrueba }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "MODO_PRUEBA se lee de la variable de entorno (por defecto: prueba).",
+      "notesInFlow": true
+    },
+    {
+      "id": "1bc3baf3-f66e-4e8f-bfff-3d0c569824d0",
+      "name": "Notion: marcar en proceso",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        1400,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "=EN PROCESO (publicación) {{ $now.toISO() }} - ejecución {{ $execution.id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Bloqueo anti-duplicados. Si n8n se cae a mitad de camino, la pieza queda \"EN PROCESO\": revisar a mano que no se haya publicado y borrar Error.",
+      "notesInFlow": true
+    },
+    {
+      "id": "82aa15e4-9d74-4c0d-b0f5-9aa1cee51006",
+      "name": "¿\"Archivo en Drive\" es una carpeta?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1400,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e2d3e27d-7b8b-4dd0-b461-61982c50fe8c",
+              "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.esCarpeta }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "9eca94ae-2b0a-47f7-9546-be17aeac2973",
+      "name": "Drive: listar imágenes de la carpeta",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1680,
+        300
+      ],
+      "parameters": {
+        "resource": "fileFolder",
+        "operation": "search",
+        "searchMethod": "name",
+        "queryString": ".jpg",
+        "returnAll": true,
+        "filter": {
+          "driveId": {
+            "__rl": true,
+            "value": "={{ $env.DRIVE_SHARED_DRIVE_ID }}",
+            "mode": "id"
+          },
+          "folderId": {
+            "__rl": true,
+            "value": "={{ $('Validar pieza y elegir ruta').first().json.fileId }}",
+            "mode": "id"
+          },
+          "whatToSearch": "files"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "notes": "Carrusel de Instagram: lista los JPG de la subcarpeta de la pieza.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "49bb76f3-7fe0-4e32-9439-ea879901e4af",
+      "name": "¿La ruta necesita archivo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1680,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "3f152cc8-84b8-42e0-a12b-7bd45066196b",
+              "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.necesitaArchivo }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "c1542ca5-4ce8-4356-b3cd-28dee86ef4be",
+      "name": "Drive: descargar archivo",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        1960,
+        300
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $('Validar pieza y elegir ruta').first().json.fileId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "notes": "Descarga el archivo desde la carpeta compartida (binario \"data\").",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "f6368371-17f4-4eb9-8aff-72d4959349b8",
+      "name": "¿Modo prueba? (antes de publicar)",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1960,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "a88e4d6c-42c5-4860-b3b6-1df3ace6c488",
+              "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.modoPrueba }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "a1ef60d1-6ef6-4ba9-9b6f-d5bd8aa06c7e",
+      "name": "Notion: escribir PRUEBA OK (sin publicar)",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        300
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $('Validar pieza y elegir ruta').first().json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "=PRUEBA OK {{ $now.toISO() }} - se publicaría en {{ $('Validar pieza y elegir ruta').first().json.plataforma }} ({{ $('Validar pieza y elegir ruta').first().json.tipo }}) por la ruta {{ $('Validar pieza y elegir ruta').first().json.ruta }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "No cambia el Estado. Para repetir la prueba: borrar el campo Error.",
+      "notesInFlow": true
+    },
+    {
+      "id": "5d08cdaf-a55d-40dd-b5d1-687a8ea62471",
+      "name": "Elegir ruta de publicación",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        2240,
+        470
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "327170d9-d73b-4636-8da2-f0ea723f19b1",
+                    "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.ruta }}",
+                    "rightValue": "instagram",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "instagram"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "3561c9ba-5f69-44a5-af60-9f14845d4ba9",
+                    "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.ruta }}",
+                    "rightValue": "linkedin_imagen",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "linkedin_imagen"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "897dc953-0b8b-4f3e-bd61-a085d78fbae2",
+                    "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.ruta }}",
+                    "rightValue": "linkedin_pdf",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "linkedin_pdf"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "2af6ca2a-6380-407e-aa01-44daaec4af45",
+                    "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.ruta }}",
+                    "rightValue": "x_imagen",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "x_imagen"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "4f18fceb-84f2-4234-b752-c38689dbf326",
+                    "leftValue": "={{ $('Validar pieza y elegir ruta').first().json.ruta }}",
+                    "rightValue": "x_hilo",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renamedOutput": true,
+              "outputKey": "x_hilo"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8830434d-446e-4110-8bc0-faa8afa9cb0b",
+      "name": "LinkedIn: publicar imagen",
+      "type": "n8n-nodes-base.linkedIn",
+      "typeVersion": 1,
+      "position": [
+        2520,
+        300
+      ],
+      "parameters": {
+        "resource": "post",
+        "operation": "create",
+        "postAs": "={{ $env.LINKEDIN_AUTHOR_URN.includes(':organization:') ? 'organization' : 'person' }}",
+        "person": "={{ $env.LINKEDIN_AUTHOR_URN.split(':').pop() }}",
+        "organization": "={{ $env.LINKEDIN_AUTHOR_URN.split(':').pop() }}",
+        "text": "={{ $('Validar pieza y elegir ruta').first().json.texto }}",
+        "shareMediaCategory": "IMAGE",
+        "binaryPropertyName": "data",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "",
+          "name": "LinkedIn - Marca"
+        }
+      },
+      "notes": "Nodo nativo de LinkedIn. Imagen 1200x1200 descargada de Drive.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "b31d60e2-20fe-4002-84a0-5b899f6e8b87",
+      "name": "LinkedIn: iniciar subida de PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2520,
+        470
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/rest/documents?action=initializeUpload",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "linkedInOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "LinkedIn-Version",
+              "value": "={{ $env.LINKEDIN_API_VERSION }}"
+            },
+            {
+              "name": "X-Restli-Protocol-Version",
+              "value": "2.0.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ initializeUploadRequest: { owner: $env.LINKEDIN_AUTHOR_URN } }) }}",
+        "options": {}
+      },
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "",
+          "name": "LinkedIn - Marca"
+        }
+      },
+      "notes": "El nodo nativo de LinkedIn no sube documentos: se usa la Documents API (initializeUpload -> PUT -> post).",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "55f43086-0a19-40c2-a08f-ac82887abe52",
+      "name": "Drive: descargar PDF para subir",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2800,
+        300
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $('Validar pieza y elegir ruta').first().json.fileId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "8abd4fc1-edfd-49a9-8cca-d773c7d79b59",
+      "name": "LinkedIn: subir el PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3080,
+        300
+      ],
+      "parameters": {
+        "method": "PUT",
+        "url": "={{ $('LinkedIn: iniciar subida de PDF').first().json.value.uploadUrl }}",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "linkedInOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "LinkedIn-Version",
+              "value": "={{ $env.LINKEDIN_API_VERSION }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "binaryData",
+        "inputDataFieldName": "data",
+        "options": {}
+      },
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "",
+          "name": "LinkedIn - Marca"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "6d4f427b-eac1-454a-95ee-d6b56239a065",
+      "name": "LinkedIn: crear post con el PDF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3360,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.linkedin.com/rest/posts",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "linkedInOAuth2Api",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "LinkedIn-Version",
+              "value": "={{ $env.LINKEDIN_API_VERSION }}"
+            },
+            {
+              "name": "X-Restli-Protocol-Version",
+              "value": "2.0.0"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ author: $env.LINKEDIN_AUTHOR_URN, commentary: $('Validar pieza y elegir ruta').first().json.textoLinkedIn, visibility: 'PUBLIC',\n  distribution: { feedDistribution: 'MAIN_FEED', targetEntities: [], thirdPartyDistributionChannels: [] },\n  content: { media: { title: $('Validar pieza y elegir ruta').first().json.titulo, id: $('LinkedIn: iniciar subida de PDF').first().json.value.document } },\n  lifecycleState: 'PUBLISHED', isReshareDisabledByAuthor: false }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": false
+            }
+          }
+        }
+      },
+      "credentials": {
+        "linkedInOAuth2Api": {
+          "id": "",
+          "name": "LinkedIn - Marca"
+        }
+      },
+      "notes": "La respuesta es 201 sin cuerpo: el ID del post viene en el header x-restli-id.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "39bbc3d5-5631-4dbc-bcf8-57fcb183fd44",
+      "name": "X: publicar tuit con imagen",
+      "type": "n8n-nodes-base.twitter",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        640
+      ],
+      "parameters": {
+        "resource": "tweet",
+        "operation": "create",
+        "text": "={{ $('Validar pieza y elegir ruta').first().json.texto }}",
+        "additionalFields": {
+          "attachments": "data"
+        }
+      },
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "",
+          "name": "X - Marca"
+        }
+      },
+      "notes": "Nodo nativo de X. Imagen 1200x675 descargada de Drive.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "897a8531-6b3c-4176-a391-f829637cea07",
+      "name": "X: preparar tuits del hilo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        810
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nreturn ctx.partes.map((t, i) => ({ json: { orden: i + 1, total: ctx.partes.length, text: t } }));\n"
+      }
+    },
+    {
+      "id": "7d43de80-04e0-4ff0-a772-171e24ad0fe7",
+      "name": "X: de a un tuit",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        2800,
+        470
+      ],
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      }
+    },
+    {
+      "id": "07791afa-8930-4efd-90cb-a8f6020e64e8",
+      "name": "X: elegir a qué tuit responder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        470
+      ],
+      "parameters": {
+        "jsCode": "\nlet prev = '';\ntry { if ($('X: publicar respuesta').isExecuted) prev = $('X: publicar respuesta').last().json.id; } catch (e) {}\nif (!prev) { try { if ($('X: publicar primer tuit').isExecuted) prev = $('X: publicar primer tuit').last().json.id; } catch (e) {} }\nreturn [{ json: { ...$json, replyTo: prev } }];\n"
+      }
+    },
+    {
+      "id": "87de9b79-5c5c-4da3-a0e5-25dd4a41d4d7",
+      "name": "¿Es el primer tuit del hilo?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3360,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "dd114104-c59a-4bfa-b7df-f91aa6461235",
+              "leftValue": "={{ !$json.replyTo }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "7898a6ae-7259-4ee6-b7d4-b632859e752d",
+      "name": "X: publicar primer tuit",
+      "type": "n8n-nodes-base.twitter",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        300
+      ],
+      "parameters": {
+        "resource": "tweet",
+        "operation": "create",
+        "text": "={{ $json.text }}",
+        "additionalFields": {}
+      },
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "",
+          "name": "X - Marca"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "bf5c01e1-3d65-4f7f-9136-f43e699aa824",
+      "name": "X: publicar respuesta",
+      "type": "n8n-nodes-base.twitter",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        470
+      ],
+      "parameters": {
+        "resource": "tweet",
+        "operation": "create",
+        "text": "={{ $('X: elegir a qué tuit responder').last().json.text }}",
+        "additionalFields": {
+          "inReplyToStatusId": {
+            "__rl": true,
+            "value": "={{ $('X: elegir a qué tuit responder').last().json.replyTo }}",
+            "mode": "id"
+          }
+        }
+      },
+      "credentials": {
+        "twitterOAuth2Api": {
+          "id": "",
+          "name": "X - Marca"
+        }
+      },
+      "notes": "Responde al tuit anterior del hilo.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "fffd685e-e914-489c-ab7c-64f797277ac5",
+      "name": "IG: preparar lista de imágenes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2520,
+        980
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nlet ids;\nif (ctx.esCarpeta) {\n  ids = $('Drive: listar imágenes de la carpeta').all().map(i => i.json)\n    .filter(f => /image\\/jpeg/.test(f.mimeType || '') || /\\.jpe?g$/i.test(f.name || ''))\n    .sort((a, b) => String(a.name).localeCompare(String(b.name))).map(f => f.id);\n} else ids = [ctx.fileId];\nif (!ids.length) throw new Error('No hay imágenes JPG en la carpeta de Drive.');\nif (ids.length > 10) throw new Error('Instagram admite hasta 10 imágenes por carrusel (hay ' + ids.length + ').');\nreturn ids.map((id, i) => ({ json: { fileId: id, orden: i + 1, total: ids.length } }));\n"
+      },
+      "notes": "Instagram sólo acepta JPG como imagen (Meta). El flujo A exporta JPG para Instagram.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "aa3cfbe0-689b-4bb2-8a2f-100117f31f1a",
+      "name": "IG: compartir imagen con enlace público (Drive)",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        2800,
+        640
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "share",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.fileId }}",
+          "mode": "id"
+        },
+        "permissionsUi": {
+          "permissionsValues": {
+            "role": "reader",
+            "type": "anyone"
+          }
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "notes": "Intento 1: la unidad compartida debe permitir \"cualquiera con el enlace\". Si el administrador lo bloquea, falla y se pasa al intento 2.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "49430c0b-77db-4935-8e96-5faefe4698d6",
+      "name": "IG: armar URLs de descarga directa (intento 1)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3080,
+        640
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nreturn $('IG: preparar lista de imágenes').all().map(i => ({ json: {\n  image_url: 'https://drive.google.com/uc?export=download&id=' + i.json.fileId,\n  orden: i.json.orden, total: i.json.total, caption: i.json.total > 1 ? '' : ctx.texto, hijo: i.json.total > 1 } }));\n"
+      }
+    },
+    {
+      "id": "aee29f43-f54c-4b51-a566-0677b3d48df4",
+      "name": "IG: crear contenedor de imagen (intento 1: Drive)",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        3360,
+        640
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $env.IG_USER_ID }}",
+        "edge": "media",
+        "httpRequestMethod": "POST",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "image_url",
+                "value": "={{ $json.image_url }}"
+              },
+              {
+                "name": "caption",
+                "value": "={{ $json.caption }}"
+              },
+              {
+                "name": "is_carousel_item",
+                "value": "={{ $json.hijo }}"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Meta descarga la imagen desde image_url. Si el error aparece acá, Drive no sirvió como host.",
+      "notesInFlow": true
+    },
+    {
+      "id": "3b57096f-451f-46e5-a119-827dcc4d194f",
+      "name": "IG: evaluar contenedores (intento 1)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3640,
+        640
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nconst items = $input.all().map(i => i.json);\nconst fallo = items.find(i => i.error || !i.id);\nif (fallo) return [{ json: { ok: false, detalle: JSON.stringify(fallo.error || fallo).slice(0, 400) } }];\nreturn [{ json: items.length > 1 ? { ok: true, carrusel: true, children: items.map(i => i.id).join(','), caption: ctx.texto }\n                                  : { ok: true, carrusel: false, id: items[0].id } }];\n"
+      }
+    },
+    {
+      "id": "8f133280-e6c2-49ca-82e9-2924581e077c",
+      "name": "IG: ¿intento 1 funcionó?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "bfad8513-dd21-4d89-bb8a-1dd50f1617bc",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "8ee324d5-b501-441b-ac9f-249e70e9ca80",
+      "name": "IG: ¿hay hosting público configurado?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4200,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c92b7525-8fbe-4085-939f-ae522061f10c",
+              "leftValue": "={{ !!$env.IG_PUBLIC_BUCKET }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "notes": "Intento 2 sólo si IG_PUBLIC_BUCKET está definido en .env. Si no, se salta directo a publicación manual.",
+      "notesInFlow": true
+    },
+    {
+      "id": "ba514139-2cbb-4022-a4a6-04341b76f06e",
+      "name": "IG: lista de imágenes para el hosting público",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4480,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nreturn $('IG: preparar lista de imágenes').all().map(i => ({ json: i.json }));\n"
+      }
+    },
+    {
+      "id": "55af87e7-1aa0-4b8c-811e-3b1e7ee03f1d",
+      "name": "IG: descargar imagen de Drive (intento 2)",
+      "type": "n8n-nodes-base.googleDrive",
+      "typeVersion": 3,
+      "position": [
+        4760,
+        300
+      ],
+      "parameters": {
+        "resource": "file",
+        "operation": "download",
+        "fileId": {
+          "__rl": true,
+          "value": "={{ $json.fileId }}",
+          "mode": "id"
+        },
+        "options": {}
+      },
+      "credentials": {
+        "googleDriveOAuth2Api": {
+          "id": "",
+          "name": "Google Drive - Equipo"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "4e89bf37-6b6a-4730-b882-bf9ea8de8859",
+      "name": "IG: subir imagen al bucket público (intento 2)",
+      "type": "n8n-nodes-base.googleCloudStorage",
+      "typeVersion": 1,
+      "position": [
+        5040,
+        300
+      ],
+      "parameters": {
+        "resource": "object",
+        "operation": "create",
+        "bucketName": "={{ $env.IG_PUBLIC_BUCKET }}",
+        "objectName": "={{ 'ig/' + $('Validar pieza y elegir ruta').first().json.pageId + '/' + $('IG: lista de imágenes para el hosting público').item.json.orden + '.jpg' }}",
+        "createFields": {},
+        "useBinaryData": true,
+        "binaryPropertyName": "data"
+      },
+      "credentials": {
+        "googleCloudStorageOAuth2Api": {
+          "id": "",
+          "name": "Google Cloud Storage - Equipo"
+        }
+      },
+      "notes": "Bucket de Google Cloud Storage con acceso público de lectura. Alternativa equivalente: S3/R2 con el nodo AWS S3.",
+      "notesInFlow": true,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "3d617b80-2ad9-48c6-9335-b0c66e6f962d",
+      "name": "IG: armar URLs del hosting público (intento 2)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5320,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nconst base = 'https://storage.googleapis.com/' + $env.IG_PUBLIC_BUCKET + '/';\nreturn $('IG: lista de imágenes para el hosting público').all().map(i => ({ json: {\n  image_url: base + 'ig/' + ctx.pageId + '/' + i.json.orden + '.jpg',\n  orden: i.json.orden, total: i.json.total, caption: i.json.total > 1 ? '' : ctx.texto, hijo: i.json.total > 1 } }));\n"
+      }
+    },
+    {
+      "id": "e84ee8c6-cb1f-41c7-9fde-72e3c7def280",
+      "name": "IG: crear contenedor de imagen (intento 2: hosting público)",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        5600,
+        300
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $env.IG_USER_ID }}",
+        "edge": "media",
+        "httpRequestMethod": "POST",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "image_url",
+                "value": "={{ $json.image_url }}"
+              },
+              {
+                "name": "caption",
+                "value": "={{ $json.caption }}"
+              },
+              {
+                "name": "is_carousel_item",
+                "value": "={{ $json.hijo }}"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueRegularOutput",
+      "notes": "Mismo paso que el intento 1 pero con URL del bucket.",
+      "notesInFlow": true
+    },
+    {
+      "id": "873d8550-ddf6-4698-bc2f-ff019d865f3c",
+      "name": "IG: evaluar contenedores (intento 2)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5880,
+        300
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nconst items = $input.all().map(i => i.json);\nconst fallo = items.find(i => i.error || !i.id);\nif (fallo) return [{ json: { ok: false, detalle: JSON.stringify(fallo.error || fallo).slice(0, 400) } }];\nreturn [{ json: items.length > 1 ? { ok: true, carrusel: true, children: items.map(i => i.id).join(','), caption: ctx.texto }\n                                  : { ok: true, carrusel: false, id: items[0].id } }];\n"
+      }
+    },
+    {
+      "id": "231eff1e-7c79-49e3-8667-abf9787ac44b",
+      "name": "IG: ¿intento 2 funcionó?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        6160,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "83c096e9-ccc5-41f0-97a8-fc6f93e58a4a",
+              "leftValue": "={{ $json.ok }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "0d375ce0-8366-45b3-bd91-cc7e3bdc00dc",
+      "name": "IG: pasar a publicación manual",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4480,
+        470
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nreturn [{ json: { pageId: ctx.pageId, texto: ('MANUAL IG: Instagram rechazó la imagen por URL pública y no hay hosting alternativo que funcione. Publicar a mano con el archivo de Drive: ' + ctx.archivo).slice(0, 1800) } }];\n"
+      }
+    },
+    {
+      "id": "dde8be7d-7c71-4971-9827-c1affa9ba80d",
+      "name": "Notion: avisar publicación manual de Instagram",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        4760,
+        470
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "={{ $json.texto }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Paso 3 del plan: el archivo queda en Drive, el aviso queda en Error (armar una vista/aviso de Notion con \"Error contiene MANUAL IG\") y Estado sigue en Aprobado. Quien publique a mano pasa el Estado a Publicado y pega el enlace.",
+      "notesInFlow": true
+    },
+    {
+      "id": "05f7c9cb-de7c-4506-870d-bff249dc9001",
+      "name": "IG: ¿es carrusel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        4200,
+        470
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "16336ec5-d22d-421e-8138-c9edbad8bb11",
+              "leftValue": "={{ $json.carrusel }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "96ba4996-9c18-49e2-9288-0f99e1958e56",
+      "name": "IG: crear contenedor del carrusel",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        4480,
+        640
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $env.IG_USER_ID }}",
+        "edge": "media",
+        "httpRequestMethod": "POST",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "media_type",
+                "value": "CAROUSEL"
+              },
+              {
+                "name": "children",
+                "value": "={{ $json.children }}"
+              },
+              {
+                "name": "caption",
+                "value": "={{ $json.caption }}"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "a3c7258d-1376-481c-8d88-0872d6f382ae",
+      "name": "IG: esperar procesamiento",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        4480,
+        810
+      ],
+      "parameters": {
+        "amount": 10,
+        "unit": "seconds"
+      }
+    },
+    {
+      "id": "99ec4397-b469-47a9-b53a-9f8327a8226d",
+      "name": "IG: consultar estado del contenedor",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        4760,
+        640
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $json.id }}",
+        "edge": "",
+        "httpRequestMethod": "GET",
+        "options": {
+          "fields": {
+            "field": [
+              {
+                "name": "status_code"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "a0e5d6d2-c804-4915-bd1c-4abb58ec7fce",
+      "name": "IG: verificar que esté FINISHED",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5040,
+        470
+      ],
+      "parameters": {
+        "jsCode": "\nconst st = $json.status_code;\nif (st !== 'FINISHED') throw new Error('El contenedor de Instagram no quedó listo (status_code=' + st + ').');\nreturn [{ json: { creation_id: $json.id } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "7a6fc1b9-a899-4148-8ffd-1d4d83927ca3",
+      "name": "IG: publicar contenedor",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        5320,
+        470
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $env.IG_USER_ID }}",
+        "edge": "media_publish",
+        "httpRequestMethod": "POST",
+        "options": {
+          "queryParameters": {
+            "parameter": [
+              {
+                "name": "creation_id",
+                "value": "={{ $json.creation_id }}"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "a7463f8b-dc0a-4638-aa63-b4efda21f3f9",
+      "name": "IG: obtener enlace del post",
+      "type": "n8n-nodes-base.facebookGraphApi",
+      "typeVersion": 1,
+      "position": [
+        5600,
+        470
+      ],
+      "parameters": {
+        "graphApiVersion": "v23.0",
+        "node": "={{ $json.id }}",
+        "edge": "",
+        "httpRequestMethod": "GET",
+        "options": {
+          "fields": {
+            "field": [
+              {
+                "name": "permalink"
+              }
+            ]
+          }
+        }
+      },
+      "credentials": {
+        "facebookGraphApi": {
+          "id": "",
+          "name": "Meta Graph - Instagram"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "c0e5b964-e041-4c6c-8a6a-4ffad15a5cc6",
+      "name": "Armar resultado de publicación",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2800,
+        810
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nlet enlace = '';\nif (ctx.ruta === 'instagram') enlace = $('IG: obtener enlace del post').first().json.permalink;\nelse if (ctx.ruta === 'linkedin_imagen') enlace = 'https://www.linkedin.com/feed/update/' + $('LinkedIn: publicar imagen').first().json.id + '/';\nelse if (ctx.ruta === 'linkedin_pdf') enlace = 'https://www.linkedin.com/feed/update/' + ($('LinkedIn: crear post con el PDF').first().json.headers['x-restli-id']) + '/';\nelse if (ctx.ruta === 'x_imagen') enlace = 'https://x.com/i/status/' + $('X: publicar tuit con imagen').first().json.id;\nelse if (ctx.ruta === 'x_hilo') enlace = 'https://x.com/i/status/' + $('X: publicar primer tuit').first().json.id;\nif (!enlace) throw new Error('Se publicó pero no pude obtener el enlace del post. Revisar a mano.');\nreturn [{ json: { pageId: ctx.pageId, enlace } }];\n"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "49c7bc3e-a2a8-46a7-ab00-d9073cfda291",
+      "name": "Notion: marcar Publicado y guardar enlace",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        3080,
+        810
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Estado|status",
+              "statusValue": "Publicado"
+            },
+            {
+              "key": "Enlace del post|url",
+              "urlValue": "={{ $json.enlace }}"
+            },
+            {
+              "key": "Error|rich_text",
+              "textContent": "=Publicado OK {{ $now.toISO() }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "Éxito: Estado = Publicado y \"Enlace del post\" cargado.",
+      "notesInFlow": true
+    },
+    {
+      "id": "76acf83d-dab0-4554-bbb8-a97b75b838b5",
+      "name": "Registrar fallo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        640
+      ],
+      "parameters": {
+        "jsCode": "\nconst ctx = $('Validar pieza y elegir ruta').first().json;\nconst e = $json.error;\nlet msg = typeof e === 'string' ? e : (e && (e.message || e.description)) || JSON.stringify($json).slice(0, 400);\nif (e && e.node && e.node.name) msg = '[' + e.node.name + '] ' + msg;\n// Si un hilo ya publicó el primer tuit, reintentar duplicaría tuits: pasa a manual.\nlet parcial = false;\nif (ctx.ruta === 'x_hilo') { try { parcial = $('X: publicar primer tuit').isExecuted; } catch (x) {} }\nif (parcial) return [{ json: { pageId: ctx.pageId, texto: ('MANUAL X: el hilo quedó publicado a medias (no se reintenta para no duplicar). ' + msg).slice(0, 1800) } }];\nconst m = (ctx.errorActual || '').match(/^ERROR \\(intento (\\d)\\/3\\)/);\nconst n = (m ? parseInt(m[1], 10) : 0) + 1;\nconst texto = (n >= 3 ? 'REINTENTOS AGOTADOS (3/3): ' : 'ERROR (intento ' + n + '/3): ') + msg;\nreturn [{ json: { pageId: ctx.pageId, texto: texto.slice(0, 1800) } }];\n"
+      }
+    },
+    {
+      "id": "60ff927a-39b2-4306-b3ca-34a190d7e7d6",
+      "name": "Notion: guardar error (Estado sigue Aprobado)",
+      "type": "n8n-nodes-base.notion",
+      "typeVersion": 2.2,
+      "position": [
+        2240,
+        640
+      ],
+      "parameters": {
+        "resource": "databasePage",
+        "operation": "update",
+        "pageId": {
+          "__rl": true,
+          "value": "={{ $json.pageId }}",
+          "mode": "id"
+        },
+        "simple": false,
+        "propertiesUi": {
+          "propertyValues": [
+            {
+              "key": "Error|rich_text",
+              "textContent": "={{ $json.texto }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "credentials": {
+        "notionApi": {
+          "id": "",
+          "name": "Notion - Calendario de contenidos"
+        }
+      },
+      "notes": "3 intentos en total (1 + 2 reintentos, una corrida de 15 min cada uno). Luego REINTENTOS AGOTADOS: borrar Error para volver a intentar.",
+      "notesInFlow": true
+    },
+    {
+      "id": "58b9cee0-7472-42a5-a9bd-4c83f1f33f57",
+      "name": "Nota 55",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        40
+      ],
+      "parameters": {
+        "content": "## B - Publicación\nCada 15 min (zona Buenos Aires) toma 1 pieza **Aprobada**, con fecha vencida, las 4 casillas tildadas y archivo en Drive.\n\n**MODO_PRUEBA=true (por defecto):** no publica; escribe \"PRUEBA OK\" en Error y no toca el Estado.\nPara publicar de verdad: MODO_PRUEBA=false en .env y reiniciar el contenedor.\n\nPlataformas: LinkedIn y X (nodos nativos), Instagram (Facebook Graph API). Otras plataformas se ignoran.",
+        "width": 560,
+        "height": 250
+      }
+    }
+  ],
+  "connections": {
+    "Cada 15 minutos": {
+      "main": [
+        [
+          {
+            "node": "Notion: buscar piezas listas para publicar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ejecutar a mano (prueba)": {
+      "main": [
+        [
+          {
+            "node": "Notion: buscar piezas listas para publicar",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: buscar piezas listas para publicar": {
+      "main": [
+        [
+          {
+            "node": "Validar pieza y elegir ruta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validar pieza y elegir ruta": {
+      "main": [
+        [
+          {
+            "node": "¿Pieza válida?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Pieza válida?": {
+      "main": [
+        [
+          {
+            "node": "¿Modo prueba? (antes de bloquear)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notion: registrar bloqueo o aviso manual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Modo prueba? (antes de bloquear)": {
+      "main": [
+        [
+          {
+            "node": "¿\"Archivo en Drive\" es una carpeta?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notion: marcar en proceso",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notion: marcar en proceso": {
+      "main": [
+        [
+          {
+            "node": "¿\"Archivo en Drive\" es una carpeta?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿\"Archivo en Drive\" es una carpeta?": {
+      "main": [
+        [
+          {
+            "node": "Drive: listar imágenes de la carpeta",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿La ruta necesita archivo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿La ruta necesita archivo?": {
+      "main": [
+        [
+          {
+            "node": "Drive: descargar archivo",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "¿Modo prueba? (antes de publicar)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: listar imágenes de la carpeta": {
+      "main": [
+        [
+          {
+            "node": "¿Modo prueba? (antes de publicar)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: descargar archivo": {
+      "main": [
+        [
+          {
+            "node": "¿Modo prueba? (antes de publicar)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Modo prueba? (antes de publicar)": {
+      "main": [
+        [
+          {
+            "node": "Notion: escribir PRUEBA OK (sin publicar)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Elegir ruta de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Elegir ruta de publicación": {
+      "main": [
+        [
+          {
+            "node": "IG: preparar lista de imágenes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LinkedIn: publicar imagen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "LinkedIn: iniciar subida de PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "X: publicar tuit con imagen",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "X: preparar tuits del hilo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LinkedIn: publicar imagen": {
+      "main": [
+        [
+          {
+            "node": "Armar resultado de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LinkedIn: iniciar subida de PDF": {
+      "main": [
+        [
+          {
+            "node": "Drive: descargar PDF para subir",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drive: descargar PDF para subir": {
+      "main": [
+        [
+          {
+            "node": "LinkedIn: subir el PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LinkedIn: subir el PDF": {
+      "main": [
+        [
+          {
+            "node": "LinkedIn: crear post con el PDF",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "LinkedIn: crear post con el PDF": {
+      "main": [
+        [
+          {
+            "node": "Armar resultado de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: publicar tuit con imagen": {
+      "main": [
+        [
+          {
+            "node": "Armar resultado de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: preparar tuits del hilo": {
+      "main": [
+        [
+          {
+            "node": "X: de a un tuit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: de a un tuit": {
+      "main": [
+        [
+          {
+            "node": "Armar resultado de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "X: elegir a qué tuit responder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: elegir a qué tuit responder": {
+      "main": [
+        [
+          {
+            "node": "¿Es el primer tuit del hilo?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "¿Es el primer tuit del hilo?": {
+      "main": [
+        [
+          {
+            "node": "X: publicar primer tuit",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "X: publicar respuesta",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: publicar primer tuit": {
+      "main": [
+        [
+          {
+            "node": "X: de a un tuit",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "X: publicar respuesta": {
+      "main": [
+        [
+          {
+            "node": "X: de a un tuit",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: preparar lista de imágenes": {
+      "main": [
+        [
+          {
+            "node": "IG: compartir imagen con enlace público (Drive)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: compartir imagen con enlace público (Drive)": {
+      "main": [
+        [
+          {
+            "node": "IG: armar URLs de descarga directa (intento 1)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: armar URLs de descarga directa (intento 1)": {
+      "main": [
+        [
+          {
+            "node": "IG: crear contenedor de imagen (intento 1: Drive)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: crear contenedor de imagen (intento 1: Drive)": {
+      "main": [
+        [
+          {
+            "node": "IG: evaluar contenedores (intento 1)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: evaluar contenedores (intento 1)": {
+      "main": [
+        [
+          {
+            "node": "IG: ¿intento 1 funcionó?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: ¿intento 1 funcionó?": {
+      "main": [
+        [
+          {
+            "node": "IG: ¿es carrusel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IG: ¿hay hosting público configurado?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: ¿hay hosting público configurado?": {
+      "main": [
+        [
+          {
+            "node": "IG: lista de imágenes para el hosting público",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IG: pasar a publicación manual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: lista de imágenes para el hosting público": {
+      "main": [
+        [
+          {
+            "node": "IG: descargar imagen de Drive (intento 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: descargar imagen de Drive (intento 2)": {
+      "main": [
+        [
+          {
+            "node": "IG: subir imagen al bucket público (intento 2)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: subir imagen al bucket público (intento 2)": {
+      "main": [
+        [
+          {
+            "node": "IG: armar URLs del hosting público (intento 2)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: armar URLs del hosting público (intento 2)": {
+      "main": [
+        [
+          {
+            "node": "IG: crear contenedor de imagen (intento 2: hosting público)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: crear contenedor de imagen (intento 2: hosting público)": {
+      "main": [
+        [
+          {
+            "node": "IG: evaluar contenedores (intento 2)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: evaluar contenedores (intento 2)": {
+      "main": [
+        [
+          {
+            "node": "IG: ¿intento 2 funcionó?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: ¿intento 2 funcionó?": {
+      "main": [
+        [
+          {
+            "node": "IG: ¿es carrusel?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IG: pasar a publicación manual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: pasar a publicación manual": {
+      "main": [
+        [
+          {
+            "node": "Notion: avisar publicación manual de Instagram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: ¿es carrusel?": {
+      "main": [
+        [
+          {
+            "node": "IG: crear contenedor del carrusel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "IG: esperar procesamiento",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: crear contenedor del carrusel": {
+      "main": [
+        [
+          {
+            "node": "IG: esperar procesamiento",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: esperar procesamiento": {
+      "main": [
+        [
+          {
+            "node": "IG: consultar estado del contenedor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: consultar estado del contenedor": {
+      "main": [
+        [
+          {
+            "node": "IG: verificar que esté FINISHED",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: verificar que esté FINISHED": {
+      "main": [
+        [
+          {
+            "node": "IG: publicar contenedor",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: publicar contenedor": {
+      "main": [
+        [
+          {
+            "node": "IG: obtener enlace del post",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IG: obtener enlace del post": {
+      "main": [
+        [
+          {
+            "node": "Armar resultado de publicación",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Armar resultado de publicación": {
+      "main": [
+        [
+          {
+            "node": "Notion: marcar Publicado y guardar enlace",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Registrar fallo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Registrar fallo": {
+      "main": [
+        [
+          {
+            "node": "Notion: guardar error (Estado sigue Aprobado)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Argentina/Buenos_Aires",
+    "executionTimeout": 900
+  },
+  "pinData": {},
+  "tags": []
+}
